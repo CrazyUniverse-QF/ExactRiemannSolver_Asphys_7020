@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,7 +14,7 @@ import exactRP
 # --------------------------------------------------------------------
 # constants
 L = 1.0  # 1-D computational domain size
-N_In = 1024  # number of computing cells
+N_In = 128  # number of computing cells
 cfl = 1.0  # Courant factor
 nghost = 2  # number of ghost zones
 gamma = 5.0 / 3.0  # ratio of specific heats
@@ -115,8 +116,20 @@ def Conserved2Primitive(U):
     W[2] = U[2] / U[0]
     W[3] = U[3] / U[0]
     W[4] = ComputePressure(U[0], U[1], U[2], U[3], U[4])
+    # P = (gamma - 1.0) * (U[4] - 0.5 * (U[1] ** 2 + U[2] ** 2 + U[3] ** 2) / U[0])
+    # W[4] = (gamma - 1.0) * (U[4] - 0.5 * (U[1] ** 2 + U[2] ** 2 + U[3] ** 2) / U[0])
 
     return W
+
+@cuda.jit(device=True)
+def Conserved2Primitive_d(U, W):
+
+    W[0] = U[0]
+    W[1] = U[1] / U[0]
+    W[2] = U[2] / U[0]
+    W[3] = U[3] / U[0]
+    W[4] = (gamma - 1.0) * (U[4] - 0.5 * (U[1] ** 2 + U[2] ** 2 + U[3] ** 2) / U[0])
+
 
 
 # -------------------------------------------------------------------
@@ -133,6 +146,14 @@ def Primitive2Conserved(W):
 
     return U
 
+@cuda.jit(device=True)
+def Primitive2Conserved_d(W, U):
+    # gamma = 5.0 / 3.0
+    U[0] = W[0]
+    U[1] = W[0] * W[1]
+    U[2] = W[0] * W[2]
+    U[3] = W[0] * W[3]
+    U[4] = W[4] / (gamma - 1.0) + 0.5 * W[0] * (W[1] ** 2.0 + W[2] ** 2.0 + W[3] ** 2.0)
 
 # -------------------------------------------------------------------
 # piecewise-linear data reconstruction
@@ -169,6 +190,50 @@ def DataReconstruction_PLM(U):
         R[j] = Primitive2Conserved(R[j])
 
     return L, R
+
+
+@cuda.jit
+def DataReconstruction_PLM_d(U, W, L, R, N):
+    j = cuda.threadIdx.x + cuda.blockDim.x * cuda.blockIdx.x
+    if j < N:
+        Conserved2Primitive_d(U[j], W[j])
+
+    # cuda.syncthreads()  # ensures all threads have finished the previous step
+
+    if 1 <= j < N - 1:
+        # ComputeLimitedSlope_d(W[j - 1], W[j], W[j + 1], slope_limited)
+        slope_L = cuda.local.array(shape=(5,), dtype=np.float64)
+        slope_R = cuda.local.array(shape=(5,), dtype=np.float64)
+        slope_limited = cuda.local.array(shape=(5,), dtype=np.float64)
+        for i in range(5):
+            slope_L[i] = W[j, i] - W[j - 1, i]
+            slope_R[i] = W[j + 1, i] - W[j, i]
+        # apply the minmod limiter
+        for i in range(5):
+            if slope_L[i] * slope_R[i] > 0.0:
+                if abs(slope_L[i]) < abs(slope_R[i]):
+                    slope_limited[i] = slope_L[i]
+                else:
+                    slope_limited[i] = slope_R[i]
+            else:
+                slope_limited[i] = 0.0
+
+
+        for i in range(5):
+            L[j, i] = W[j, i] - 0.5 * slope_limited[i]
+            print(L[j, i])
+            R[j, i] = W[j, i] + 0.5 * slope_limited[i]
+
+            # ensure face-centered variables lie between nearby volume-averaged (~cell-centered) values
+            L[j, i] = max(L[j, i], min(W[j - 1, i], W[j, i]))
+            L[j, i] = min(L[j, i], max(W[j - 1, i], W[j, i]))
+            R[j, i] = 2.0 * W[j, i] - L[j, i]
+
+            R[j, i] = max(R[j, i], min(W[j + 1, i], W[j, i]))
+            R[j, i] = min(R[j, i], max(W[j + 1, i], W[j, i]))
+            L[j, i] = 2.0 * W[j, i] - R[j, i]
+        Primitive2Conserved_d(L[j], L[j])
+        Primitive2Conserved_d(R[j], R[j])
 
 
 # -------------------------------------------------------------------
@@ -297,65 +362,19 @@ def calculate_flux(nghost, N, L, R, flux_L, flux_R, flux, amp, EigenValue, Eigen
         if nghost <= j < N - nghost + 1:
             exactFlux_d(R[j - 1], L[j], flux_L[j], flux_R[j], flux[j], amp[j], EigenValue[j], EigenVector_R[j])
 
-
-# @jit
-def exactFlux(L, R):
-    #  compute the enthalpy of the left and right states: H = (E+P)/rho
-    P_L = ComputePressure(L[0], L[1], L[2], L[3], L[4])
-    P_R = ComputePressure(R[0], R[1], R[2], R[3], R[4])
-    H_L = (L[4] + P_L) / L[0]
-    H_R = (R[4] + P_R) / R[0]
-
-    #  compute Roe average values
-    rhoL_sqrt = L[0] ** 0.5
-    rhoR_sqrt = R[0] ** 0.5
-
-    u = (L[1] / rhoL_sqrt + R[1] / rhoR_sqrt) / (rhoL_sqrt + rhoR_sqrt)
-    v = (L[2] / rhoL_sqrt + R[2] / rhoR_sqrt) / (rhoL_sqrt + rhoR_sqrt)
-    w = (L[3] / rhoL_sqrt + R[3] / rhoR_sqrt) / (rhoL_sqrt + rhoR_sqrt)
-    H = (rhoL_sqrt * H_L + rhoR_sqrt * H_R) / (rhoL_sqrt + rhoR_sqrt)
-    V2 = u * u + v * v + w * w
-    #  check negative pressure
-    assert H - 0.5 * V2 > 0.0, "negative pressure!"
-    a = ((gamma - 1.0) * (H - 0.5 * V2)) ** 0.5
-
-    #  compute the amplitudes of different characteristic waves
-    dU = R - L
-    amp = np.empty(5)
-    amp[2] = dU[2] - v * dU[0]
-    amp[3] = dU[3] - w * dU[0]
-    amp[1] = (gamma - 1.0) / a ** 2.0 \
-             * (dU[0] * (H - u ** 2.0) + u * dU[1] - dU[4] + v * amp[2] + w * amp[3])
-    amp[0] = 0.5 / a * (dU[0] * (u + a) - dU[1] - a * amp[1])
-    amp[4] = dU[0] - amp[0] - amp[1]
-
-    #  compute the eigenvalues and right eigenvector matrix
-    EigenValue = np.array([u - a, u, u, u, u + a])
-    EigenVector_R = np.array([[1.0, u - a, v, w, H - u * a],
-                              [1.0, u, v, w, 0.5 * V2],
-                              [0.0, 0.0, 1.0, 0.0, v],
-                              [0.0, 0.0, 0.0, 1.0, w],
-                              [1.0, u + a, v, w, H + u * a]])
-
-    #  compute the fluxes of the left and right states
-    flux_L = Conserved2Flux(L)
-    flux_R = Conserved2Flux(R)
-
-    #  compute the Roe flux
-    amp *= np.abs(EigenValue)
-    flux = 0.5 * (flux_L + flux_R) - 0.5 * amp.dot(EigenVector_R)
-
-    return flux
-
-
-# @njit(parallel=True)
-def compute_flux(N, L, R, nghost):
-    flux = np.empty((N, 5))
-    for j in prange(nghost, N - nghost + 1):
-        flux[j] = exactFlux(R[j - 1], L[j])
-
-    return flux
-
+@cuda.jit
+def update_flux_cuda(L, R, dt, dx, N):
+    j = cuda.threadIdx.x + cuda.blockDim.x * cuda.blockIdx.x
+    if j < N - 1:
+        flux_L = cuda.local.array(shape=(5,), dtype=np.float64)
+        flux_R = cuda.local.array(shape=(5,), dtype=np.float64)
+        dflux = cuda.local.array(shape=(5,), dtype=np.float64)
+        Conserved2Flux_d(L[j], flux_L)
+        Conserved2Flux_d(R[j], flux_R)
+        for i in range(5):
+            dflux[i] = 0.5 * dt / dx * (flux_R[i] - flux_L[i])
+            L[j, i] -= dflux[i]
+            R[j, i] -= dflux[i]
 
 # --------------------------------------------------------------------
 # main
@@ -368,24 +387,36 @@ for j in range(N_In):
     x[j] = (j + 0.5) * dx  # cell-centered coordinates
     U[j + nghost] = InitialCondition(x[j])
 
+start_time = time.time()
+
 while (t < end_time):
+    # Decide the number of CUDA threads
+    threads_per_block = 128
+    blocks_per_grid = (N + (threads_per_block - 1)) // threads_per_block
     # set boundary condition
     BoundaryCondition(U)
     dt = ComputeTimestep(U)
     # print("t = %13.7e --> %13.7e, dt = %13.7e" % (t, t + dt, dt))
     L, R = DataReconstruction_PLM(U)
+    # L = np.empty((N, 5))
+    # R = np.empty((N, 5))
+    # W = np.empty((N, 5))
+    # DataReconstruction_PLM_d[blocks_per_grid, threads_per_block](U, W, L, R, N)
+    # cuda.synchronize()
+
+    # cuda.syncthreads()
 
     # update the face-centered variables by 0.5*dt
-    for j in range(1, N - 1):
-        flux_L = Conserved2Flux(L[j])
-        flux_R = Conserved2Flux(R[j])
-        dflux = 0.5 * dt / dx * (flux_R - flux_L)
-        L[j] -= dflux
-        R[j] -= dflux
+    # for j in range(1, N - 1):
+    #     flux_L = Conserved2Flux(L[j])
+    #     flux_R = Conserved2Flux(R[j])
+    #     dflux = 0.5 * dt / dx * (flux_R - flux_L)
+    #     L[j] -= dflux
+    #     R[j] -= dflux
+    update_flux_cuda[blocks_per_grid, threads_per_block](L, R, dt, dx, N)
+    # cuda.syncthreads()
 
-    # Decide the number of CUDA threads
-    threads_per_block = 128
-    blocks_per_grid = (N + (threads_per_block - 1)) // threads_per_block
+
     Lflux = np.empty((N, 5))
     Rflux = np.empty((N, 5))
     flux = np.empty((N, 5))
@@ -399,6 +430,10 @@ while (t < end_time):
 
     t = t + dt
 
+end_time = time.time()  # get the current time after the loop
+
+elapsed_time = end_time - start_time  # calculate the difference
+
 d = U[nghost:N - nghost, 0]
 u = U[nghost:N - nghost, 1] / U[nghost:N - nghost, 0]
 P = ComputePressure(U[nghost:N - nghost, 0], U[nghost:N - nghost, 1], U[nghost:N - nghost, 2], U[nghost:N - nghost, 3],
@@ -411,4 +446,5 @@ P = ComputePressure(U[nghost:N - nghost, 0], U[nghost:N - nghost, 1], U[nghost:N
 plt.plot(x, d, 'b-')
 plt.plot(x, u, 'r-')
 plt.plot(x, P, 'g-')
-plt.show()
+plt.savefig('result.png')
+# plt.show()
