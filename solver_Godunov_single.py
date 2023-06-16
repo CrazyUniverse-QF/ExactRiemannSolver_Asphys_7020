@@ -11,28 +11,24 @@ import exactRP
 # --------------------------------------------------------------------
 # constants
 L = 1.0  # 1-D computational domain size
-N_In = 256  # number of computing cells
+N_In = 128  # number of computing cells
 cfl = 1.0  # Courant factor
 nghost = 2  # number of ghost zones
 gamma = 5.0 / 3.0  # ratio of specific heats
-end_time = 0.2  # simulation time
+end_time = 0.25  # simulation time
 
 # derived constants
 N = N_In + 2 * nghost  # total number of cells including ghost zones
 dx = L / N_In  # spatial resolution
 
-
-# -------------------------------------------------------------------
-# define initial condition
-# -------------------------------------------------------------------
 def InitialCondition(x):
     #  Sod shock tube
     if (x < 0.5 * L):
-        d = 1  # density
-        u = 0.75  # velocity x
+        d = 1.0  # density
+        u = 0.0  # velocity x
         v = 0.0  # velocity y
         w = 0.0  # velocity z
-        P = 1  # pressure
+        P = 1.0  # pressure
         E = P / (gamma - 1.0) + 0.5 * d * (u ** 2.0 + v ** 2.0 + w ** 2.0)  # energy density
     else:
         d = 0.125
@@ -46,27 +42,18 @@ def InitialCondition(x):
     return np.array([d, d * u, d * v, d * w, E])
 
 
-# -------------------------------------------------------------------
-# define boundary condition by setting ghost zones
-# -------------------------------------------------------------------
 def BoundaryCondition(U):
     #  outflow
     U[0:nghost] = U[nghost]
     U[N - nghost:N] = U[N - nghost - 1]
 
 
-# -------------------------------------------------------------------
-# compute pressure
-# -------------------------------------------------------------------
 def ComputePressure(d, px, py, pz, e):
     P = (gamma - 1.0) * (e - 0.5 * (px ** 2.0 + py ** 2.0 + pz ** 2.0) / d)
     # assert np.all(P > 0), "negative pressure !!"
     return P
 
 
-# -------------------------------------------------------------------
-# compute time-step by the CFL condition
-# -------------------------------------------------------------------
 def ComputeTimestep(U):
     P = ComputePressure(U[:, 0], U[:, 1], U[:, 2], U[:, 3], U[:, 4])
     a = (gamma * P / U[:, 0]) ** 0.5
@@ -82,9 +69,6 @@ def ComputeTimestep(U):
     return min(dt_cfl, dt_end)
 
 
-# -------------------------------------------------------------------
-# compute limited slope
-# -------------------------------------------------------------------
 def ComputeLimitedSlope(L, C, R):
     #  compute the left and right slopes
     slope_L = C - L
@@ -100,9 +84,6 @@ def ComputeLimitedSlope(L, C, R):
     return slope_limited
 
 
-# -------------------------------------------------------------------
-# convert conserved variables to primitive variables
-# -------------------------------------------------------------------
 def Conserved2Primitive(U):
     W = np.empty(5)
 
@@ -115,9 +96,6 @@ def Conserved2Primitive(U):
     return W
 
 
-# -------------------------------------------------------------------
-# convert primitive variables to conserved variables
-# -------------------------------------------------------------------
 def Primitive2Conserved(W):
     U = np.empty(5)
 
@@ -130,9 +108,6 @@ def Primitive2Conserved(W):
     return U
 
 
-# -------------------------------------------------------------------
-# piecewise-linear data reconstruction
-# -------------------------------------------------------------------
 def DataReconstruction_PLM(U):
     #  allocate memory
     W = np.empty((N, 5))
@@ -167,9 +142,6 @@ def DataReconstruction_PLM(U):
     return L, R
 
 
-# -------------------------------------------------------------------
-# convert conserved variables to fluxes
-# -------------------------------------------------------------------
 def Conserved2Flux(U):
     flux = np.empty(5)
 
@@ -232,6 +204,84 @@ def exactFlux(L, R):
     flux = 0.5 * (flux_L + flux_R) - 0.5 * amp.dot(EigenVector_R)
     return flux
 
+def primitive_to_conservative_flux_derivatives(rho, u, p, p_star, c, Gamma, Gamma1, G1o2):
+    if p_star > p:  # Shock wave
+        A = 2. / ((Gamma + 1.) * rho)
+        B = (Gamma - 1.) / Gamma * p
+        sqrt_term = max(0., A / (B + p_star))
+        f = (p_star - p) * sqrt_term**0.5
+        df = (1. - 0.5 * (p_star - p) / (B + p_star)) * sqrt_term
+    else:  # Rarefaction wave
+        a = 2. / (Gamma1 * rho)
+        b = p * Gamma1 / Gamma
+        f = 2. * c / Gamma1 * ((p_star / p)**G1o2 - 1.)
+        df = ((p_star / p)**-G1o2) / (rho * c)
+
+    return f, df
+
+
+def exact_flux_conserved(L, R):
+    from math import fabs
+
+    # Define the constant values.
+    Gamma = 5.0 / 3.0
+    Gamma1 = Gamma - 1.
+    G1o2 = Gamma1 / (2. * Gamma)
+
+    # Transform conserved variables to primitive variables.
+    rho_l = L[0]
+    u_l = L[1] / rho_l
+    E_l = L[4]
+    p_l = (Gamma - 1.) * (E_l - 0.5 * rho_l * u_l**2)
+
+    rho_r = R[0]
+    u_r = R[1] / rho_r
+    E_r = R[4]
+    p_r = (Gamma - 1.) * (E_r - 0.5 * rho_r * u_r**2)
+
+    # Compute sound speeds of left and right states.
+    c_l = (Gamma * p_l / rho_l)**0.5
+    c_r = (Gamma * p_r / rho_r)**0.5
+
+    # Iteratively compute pressure in star region.
+    # Initial guess for pressure
+    p_star = 0.5 * (p_l + p_r)
+    p_old = p_star
+    delta_u = u_r - u_l
+
+    # Define solver criteria
+    MAX_ITER = 100
+    TOL_PRES = 1e-8
+
+    # Perform Newton-Raphson iteration to determine pressure in star region
+    nrSuccess = False
+    for it in range(1, MAX_ITER+1):
+        f_l_star, df_l_star = primitive_to_conservative_flux_derivatives(rho_l, u_l, p_l, p_old, c_l, Gamma, Gamma1, G1o2)
+        f_r_star, df_r_star = primitive_to_conservative_flux_derivatives(rho_r, u_r, p_r, p_old, c_r, Gamma, Gamma1, G1o2)
+        p_star = p_old - (f_l_star + f_r_star + delta_u) / (df_l_star + df_r_star)
+        dp = 2.0 * fabs((p_star - p_old) / (p_star + p_old))
+        if dp <= TOL_PRES:
+            nrSuccess = True
+            break
+        if p_star < 0.0:
+            p_star = TOL_PRES
+        p_old = p_star
+
+    if not nrSuccess:
+        print('[exact_flux_conserved] Newton-Raphson unable to converge')
+    else:
+        u_star = 0.5 * (u_l + u_r + f_r_star - f_l_star)
+
+    # Compute fluxes
+    flux_l = np.array(
+        [rho_l * u_l, rho_l * u_l ** 2 + p_l, u_l * (rho_l * (c_l ** 2 / Gamma1 + 0.5 * u_l ** 2) + p_l / Gamma1)])
+    flux_r = np.array(
+        [rho_r * u_r, rho_r * u_r ** 2 + p_r, u_r * (rho_r * (c_r ** 2 / Gamma1 + 0.5 * u_r ** 2) + p_r / Gamma1)])
+
+    return flux_r if u_star >= 0.0 else flux_l
+
+
+
 
 # --------------------------------------------------------------------
 # main
@@ -246,7 +296,7 @@ for j in range(N_In):
 
 
 
-while (t < end_time):
+while (t < 0.001):
     # set boundary condition
     BoundaryCondition(U)
     dt = ComputeTimestep(U)
@@ -262,7 +312,8 @@ while (t < end_time):
 
     flux = np.empty((N, 5))
     for j in range(nghost, N - nghost + 1):
-        flux[j] = exactFlux(R[j - 1], L[j])
+        # flux[j] = exactFlux(R[j - 1], L[j])
+        flux[j] = exact_flux_conserved(R[j - 1], L[j])
         # print(flux[j])
     U[nghost:N - nghost] -= dt / dx * (flux[nghost + 1:N - nghost + 1] - flux[nghost:N - nghost])
     t = t + dt
@@ -273,6 +324,9 @@ d = U[nghost:N - nghost, 0]
 u = U[nghost:N - nghost, 1] / U[nghost:N - nghost, 0]
 P = ComputePressure(U[nghost:N - nghost, 0], U[nghost:N - nghost, 1], U[nghost:N - nghost, 2], U[nghost:N - nghost, 3],
                     U[nghost:N - nghost, 4])
+data = np.column_stack((x, d, u, P))
+np.savetxt('approx_result_1.txt', data, header='x d u P', comments='')
+
 
 # Create a new figure
 plt.figure()

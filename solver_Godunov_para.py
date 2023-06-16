@@ -269,7 +269,7 @@ def Conserved2Flux_d(U, flux):
 
 
 @cuda.jit(device=True)
-def exactFlux_d(L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
+def exactFlux_d(L, R, flux):
     P_L = (gamma - 1.0) * (L[4] - 0.5 * (L[1] ** 2 + L[2] ** 2 + L[3] ** 2) / L[0])
     P_R = (gamma - 1.0) * (R[4] - 0.5 * (R[1] ** 2 + R[2] ** 2 + R[3] ** 2) / R[0])
     H_L = (L[4] + P_L) / L[0]
@@ -298,7 +298,7 @@ def exactFlux_d(L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
     #          * (dU[0] * (H - u ** 2.0) + u * dU[1] - dU[4] + v * amp[2] + w * amp[3])
     # amp[0] = 0.5 / a * (dU[0] * (u + a) - dU[1] - a * amp[1])
     # amp[4] = dU[0] - amp[0] - amp[1]
-
+    amp = cuda.local.array(5, dtype=np.float64)
     amp[2] = dU_2 - v * dU_0
     amp[3] = dU_3 - w * dU_0
     amp[1] = (gamma - 1.0) / a ** 2.0 \
@@ -306,12 +306,14 @@ def exactFlux_d(L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
     amp[0] = 0.5 / a * (dU_0 * (u + a) - dU_1 - a * amp[1])
     amp[4] = dU_0 - amp[0] - amp[1]
 
+    EigenValue = cuda.local.array(shape=(5,), dtype=np.float64)
     EigenValue[0] = u - a
     EigenValue[1] = u
     EigenValue[2] = u
     EigenValue[3] = u
     EigenValue[4] = u + a
 
+    EigenVector_R = cuda.local.array(shape=(5,5), dtype=np.float64)
     EigenVector_R[0, 0] = 1.0
     EigenVector_R[0, 1] = u - a
     EigenVector_R[0, 2] = v
@@ -342,6 +344,9 @@ def exactFlux_d(L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
     EigenVector_R[4, 3] = w
     EigenVector_R[4, 4] = H + u * a
 
+    flux_L = cuda.local.array(shape=(5,), dtype=np.float64)
+    flux_R = cuda.local.array(shape=(5,), dtype=np.float64)
+
     Conserved2Flux_d(L, flux_L)
     Conserved2Flux_d(R, flux_R)
 
@@ -356,11 +361,11 @@ def exactFlux_d(L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
 
 
 @cuda.jit
-def calculate_flux(nghost, N, L, R, flux_L, flux_R, flux, amp, EigenValue, EigenVector_R):
+def calculate_flux(nghost, N, L, R, flux):
     j = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
     if j < N:
         if nghost <= j < N - nghost + 1:
-            exactFlux_d(R[j - 1], L[j], flux_L[j], flux_R[j], flux[j], amp[j], EigenValue[j], EigenVector_R[j])
+            exactFlux_d(R[j - 1], L[j], flux[j])
 
 @cuda.jit
 def update_flux_cuda(L, R, dt, dx, N):
@@ -391,8 +396,9 @@ start_time = time.time()
 
 while (t < end_time):
     # Decide the number of CUDA threads
-    threads_per_block = 128
+    threads_per_block = 16
     blocks_per_grid = (N + (threads_per_block - 1)) // threads_per_block
+    # blocks_per_grid = 9
     # set boundary condition
     BoundaryCondition(U)
     dt = ComputeTimestep(U)
@@ -416,15 +422,8 @@ while (t < end_time):
     update_flux_cuda[blocks_per_grid, threads_per_block](L, R, dt, dx, N)
     # cuda.syncthreads()
 
-
-    Lflux = np.empty((N, 5))
-    Rflux = np.empty((N, 5))
     flux = np.empty((N, 5))
-    amps = np.empty((N, 5))
-    EigenValue = np.empty((N, 5))
-    EigenVector_R = np.empty((N, 5, 5))
-    calculate_flux[blocks_per_grid, threads_per_block](nghost, N, L, R, Lflux, Rflux, flux, amps, EigenValue,
-                                                       EigenVector_R)
+    calculate_flux[blocks_per_grid, threads_per_block](nghost, N, L, R, flux)
 
     U[nghost:N - nghost] -= dt / dx * (flux[nghost + 1:N - nghost + 1] - flux[nghost:N - nghost])
 
@@ -447,4 +446,4 @@ plt.plot(x, d, 'b-')
 plt.plot(x, u, 'r-')
 plt.plot(x, P, 'g-')
 plt.savefig('result.png')
-# plt.show()
+plt.show()
